@@ -286,8 +286,6 @@ class S3FS(FS):
         so that it can be worked on efficiently.  Any changes made to the
         file are only sent back to S3 when the file is flushed or closed.
         """
-        if self.isdir(path):
-            raise ResourceInvalidError(path)
         s3path = self._s3path(path)
         # Truncate the file if requested
         if "w" in mode:
@@ -298,8 +296,6 @@ class S3FS(FS):
             # Create the file if it's missing
             if "w" not in mode and "a" not in mode:
                 raise ResourceNotFoundError(path)
-            if not self.isdir(dirname(path)):
-                raise ParentDirectoryMissingError(path)
             k = self._sync_set_contents(s3path,"")
         #  Make sure nothing tries to read past end of socket data
         f = LimitBytesFile(k.size,k,"r")
@@ -317,21 +313,16 @@ class S3FS(FS):
         # The root directory always exists
         if self._prefix.startswith(s3path):
             return True
-        ks = self._s3bukt.list(prefix=s3path,delimiter=self._separator)
-        for k in ks:
-            # A regular file
-            if _eq_utf8(k.name,s3path):
-                return True
-            # A directory
-            if _eq_utf8(k.name,s3pathD):
-                return True
-        return False
+        ks = self._s3bukt.get_key(key_name=s3path)
+        return ks.exists()
 
     def isdir(self,path):
         """Check whether a path exists and is a directory."""
         s3path = self._s3path(path) + self._separator
         # Root is always a directory
         if s3path == "/" or s3path == self._prefix:
+            return True
+        if s3path[-1] == "/":
             return True
         # Use a list request so that we return true if there are any files
         # in that directory.  This avoids requiring a special file for the
@@ -346,14 +337,7 @@ class S3FS(FS):
 
     def isfile(self,path):
         """Check whether a path exists and is a regular file."""
-        s3path = self._s3path(path)
-        # Root is never a file
-        if self._prefix.startswith(s3path):
-            return False
-        k = self._s3bukt.get_key(s3path)
-        if k is not None:
-            return True
-        return False
+        raise TypeError("isfile not supported for S3")
 
     def listdir(self,path="./",wildcard=None,full=False,absolute=False,
                                dirs_only=False,files_only=False):
@@ -405,9 +389,6 @@ class S3FS(FS):
                 yield (name,k)
         if not isDir:
             if s3path != self._prefix:
-                if self.isfile(path):
-                    msg = "that's not a directory: %(path)s"
-                    raise ResourceInvalidError(path,msg=msg)
                 raise ResourceNotFoundError(path)
 
     def _key_is_dir(self, k):
@@ -459,52 +440,13 @@ class S3FS(FS):
         s3pathP = self._s3path(dirname(path))
         if s3pathP:
             s3pathP = s3pathP + self._separator
-        # Check various preconditions using list of parent dir
-        ks = self._s3bukt.list(prefix=s3pathP,delimiter=self._separator)
-        if s3pathP == self._prefix:
-            parentExists = True
-        else:
-            parentExists = False
-        for k in ks:
-            if not parentExists:
-                parentExists = True
-            if _eq_utf8(k.name,s3path):
-                # It's already a file
-                msg = "Destination exists as a regular file: %(path)s"
-                raise ResourceInvalidError(path, msg=msg)
-            if _eq_utf8(k.name,s3pathD):
-                # It's already a directory
-                if allow_recreate:
-                    return
-                msg = "Can not create a directory that already exists"\
-                      " (try allow_recreate=True): %(path)s"
-                raise DestinationExistsError(path, msg=msg)
-        # Create parent if required
-        if not parentExists:
-            if recursive:
-                self.makedir(dirname(path),recursive,allow_recreate)
-            else:
-                msg = "Parent directory does not exist: %(path)s"
-                raise ParentDirectoryMissingError(path, msg=msg)
         # Create an empty file representing the directory
         self._sync_set_contents(s3pathD,"")
 
     def remove(self,path):
         """Remove the file at the given path."""
         s3path = self._s3path(path)
-        ks = self._s3bukt.list(prefix=s3path,delimiter=self._separator)
-        for k in ks:
-            if _eq_utf8(k.name,s3path):
-                break
-            if _startswith_utf8(k.name,s3path + "/"):
-                msg = "that's not a file: %(path)s"
-                raise ResourceInvalidError(path,msg=msg)
-        else:
-            raise ResourceNotFoundError(path)
         self._s3bukt.delete_key(s3path)
-        k = self._s3bukt.get_key(s3path)
-        while k:
-            k = self._s3bukt.get_key(s3path)
 
     def removedir(self,path,recursive=False,force=False):
         """Remove the directory at the given path."""
@@ -528,18 +470,8 @@ class S3FS(FS):
                     raise DirectoryNotEmptyError(path)
                 self._s3bukt.delete_key(k.name)
         if not found:
-            if self.isfile(path):
-                msg = "removedir() called on a regular file: %(path)s"
-                raise ResourceInvalidError(path,msg=msg)
-            if path not in ("","/"):
-                raise ResourceNotFoundError(path)
+            raise ResourceNotFoundError(path)
         self._s3bukt.delete_key(s3path)
-        if recursive and path not in ("","/"):
-            pdir = dirname(path)
-            try:
-                self.removedir(pdir,recursive=True,force=False)
-            except DirectoryNotEmptyError:
-                pass
 
     def rename(self,src,dst):
         """Rename the file at 'src' to 'dst'."""
@@ -606,27 +538,8 @@ class S3FS(FS):
         """
         s3path_dst = self._s3path(dst)
         s3path_dstD = s3path_dst + self._separator
-        #  Check for various preconditions.
-        ks = self._s3bukt.list(prefix=s3path_dst,delimiter=self._separator)
-        dstOK = False
-        for k in ks:
-            # It exists as a regular file
-            if _eq_utf8(k.name,s3path_dst):
-                if not overwrite:
-                    raise DestinationExistsError(dst)
-                dstOK = True
-                break
-            # Check if it refers to a directory.  If so, we copy *into* it.
-            # Since S3 lists in lexicographic order, subsequent iterations
-            # of the loop will check for the existence of the new filename.
-            if _eq_utf8(k.name,s3path_dstD):
-                nm = basename(src)
-                dst = pathjoin(dirname(dst),nm)
-                s3path_dst = s3path_dstD + nm
-                dstOK = True
-        if not dstOK and not self.isdir(dirname(dst)):
-            msg = "Destination directory does not exist: %(path)s"
-            raise ParentDirectoryMissingError(dst,msg=msg)
+        if not overwrite and self.exists(dst):
+            return
         # OK, now we can copy the file.
         s3path_src = self._s3path(src)
         try:
@@ -636,11 +549,6 @@ class S3FS(FS):
                 msg = "Source is not a file: %(path)s"
                 raise ResourceInvalidError(src, msg=msg)
             raise e
-        else:
-            k = self._s3bukt.get_key(s3path_dst)
-            while k is None:
-                k = self._s3bukt.get_key(s3path_dst)
-            self._sync_key(k)
 
     def move(self,src,dst,overwrite=False,chunk_size=16384):
         """Move a file from one location to another."""
