@@ -337,7 +337,14 @@ class S3FS(FS):
 
     def isfile(self,path):
         """Check whether a path exists and is a regular file."""
-        raise TypeError("isfile not supported for S3")
+        s3path = self._s3path(path)
+        # Root is never a file
+        if self._prefix.startswith(s3path):
+            return False
+        k = self._s3bukt.get_key(s3path)
+        if k is not None:
+            return True
+        return False
 
     def listdir(self,path="./",wildcard=None,full=False,absolute=False,
                                dirs_only=False,files_only=False):
